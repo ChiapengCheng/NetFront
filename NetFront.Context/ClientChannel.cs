@@ -1,32 +1,21 @@
-﻿using NetFront.Channels;
-using NetMQ;
-using NetMQ.Sockets;
+using NetFront.Channels;
+using NetFront.Transport;
 
 namespace NetFront.Context;
 
 public class ClientChannel : Channel
 {
-    private readonly XPublisherSocket _socket;
+    private readonly TcpPubServer _socket;
 
-    public ClientChannel(XPublisherSocket socket, string address, int receiveHighWatermark, int sendHighWatermark, byte[] welcomeMsg)
+    public ClientChannel(TcpPubServer socket, string address, int receiveHighWatermark, int sendHighWatermark, byte[] welcomeMsg)
     {
         _socket = socket;
         _socket.SetWelcomeMessage(welcomeMsg);
-        _socket.Options.ReceiveHighWatermark = receiveHighWatermark;
-        _socket.Options.SendHighWatermark = sendHighWatermark;
-        _socket.Options.ManualPublisher = true;
         _socket.Bind(address);
     }
 
-    public void Subscribe(byte[] topic)
-    {
-        _socket.Subscribe(topic);
-    }
-
-    public void Unsubscribe(byte[] topic)
-    {
-        _socket.Unsubscribe(topic);
-    }
+    public void Subscribe(byte[] topic) => _socket.Subscribe(topic);
+    public void Unsubscribe(byte[] topic) => _socket.Unsubscribe(topic);
 
     public void SendHeartbeatMessage(byte[] data)
     {
@@ -36,7 +25,7 @@ public class ClientChannel : Channel
 
     public void SendUserResponseMessage(byte[] rspHeader, byte[] rspInfo, byte[] data)
     {
-        _socket.SendMoreFrame(rspHeader).SendMoreFrame(rspInfo).SendFrame(data);
+        _socket.SendMultipart(rspHeader, rspInfo, data);
         OnMsgSend(rspHeader.Length + rspInfo.Length + data.Length);
     }
 

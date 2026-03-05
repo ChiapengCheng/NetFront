@@ -1,18 +1,15 @@
-﻿using NetFront.Channels;
-using NetMQ;
-using NetMQ.Sockets;
+using NetFront.Channels;
+using NetFront.Transport;
 
 namespace NetFront.SystemApi;
 
 public class SystemChannel : Channel
 {
-    private readonly XSubscriberSocket _socket;
+    private readonly TcpSubClient _socket;
 
-    public SystemChannel(XSubscriberSocket socket, string address, int receiveHighWatermark, int sendHighWatermark)
+    public SystemChannel(TcpSubClient socket, string address, int receiveHighWatermark, int sendHighWatermark)
     {
         _socket = socket;
-        _socket.Options.ReceiveHighWatermark = receiveHighWatermark;
-        _socket.Options.SendHighWatermark = sendHighWatermark;
         _socket.Connect(address);
     }
 
@@ -23,7 +20,7 @@ public class SystemChannel : Channel
 
     public void SendUserRequestMessage(byte[] header, byte[] data)
     {
-        _socket.SendMoreFrame(header).SendFrame(data);
+        _socket.SendMultipart(header, data);
     }
 
     public void SendUserUnsubMessage(byte[] topic)
@@ -33,6 +30,6 @@ public class SystemChannel : Channel
 
     public void SendUserRequestMessage(byte[] header, byte[] data0, byte[] data1, byte[] data2)
     {
-        _socket.SendMoreFrame(header).SendMoreFrame(data0).SendMoreFrame(data1).SendFrame(data2);
+        _socket.SendMultipart(header, data0, data1, data2);
     }
 }

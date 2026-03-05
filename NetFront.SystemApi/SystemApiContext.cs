@@ -1,8 +1,7 @@
-﻿using NetFront.Frames;
+using NetFront.Frames;
 using NetFront.Messages;
+using NetFront.Transport;
 using NetFront.UserManagement;
-using NetMQ;
-using NetMQ.Sockets;
 
 namespace NetFront.SystemApi;
 
@@ -14,10 +13,11 @@ public class SystemApiContext : IDisposable
     private const int SYSTEM_WAIT_INTERVAL = 500;
     private ConnectionStatusEnum _conStatus;
     private LoginStatusEnum _loginStatus;
-    private PublisherSocket _process = default!;
-    private PublisherSocket _publicMain = default!;
-    private PublisherSocket _publicSub = default!;
+    private InprocChannel _process = default!;
+    private InprocChannel _publicMain = default!;
+    private InprocChannel _publicSub = default!;
     private int _requestId;
+    private CancellationTokenSource _runCts = new();
 
     public LoginStatusEnum LoginStatus
     {
@@ -36,32 +36,167 @@ public class SystemApiContext : IDisposable
 
     public void Dispose()
     {
+        _runCts.Cancel();
         GC.SuppressFinalize(this);
     }
 
     private void RunCore(string address)
     {
-        Task.Factory.StartNew(() =>
+        Task.Factory.StartNew(async () =>
         {
-            try
-            {
-                var timer = new NetMQTimer(HEARTBEAT_CHECK_TIMER_INTERVAL);
-                using var publicSocket = new XSubscriberSocket();
-                using var processSocket = new XSubscriberSocket();
-                using var systemSocket = new XSubscriberSocket();
-                using var poller = new NetMQPoller();
-                var systemChannel = new SystemChannel(systemSocket, address, 0, 0);
-                var processChannel = new ProcesslChannel(processSocket, INTERNAL_PROCESS_ADDRESS, 0, 0);
-                var publicChannel = new PublicChannel(publicSocket, INTERNAL_PUBLIC_ADDRESS, 0, 0);
+            var ct = _runCts.Token;
+            using var publicSocket = new InprocChannel();
+            using var processSocket = new InprocChannel();
+            using var systemSocket = new TcpSubClient();
+            var systemChannel = new SystemChannel(systemSocket, address, 0, 0);
+            var processChannel = new ProcesslChannel(processSocket, INTERNAL_PROCESS_ADDRESS, 0, 0);
+            var publicChannel = new PublicChannel(publicSocket, INTERNAL_PUBLIC_ADDRESS, 0, 0);
 
-                var hbTimeFlag = 0L;
-                var checkTimeFlag = 0L;
-                var header = new UserRequestHeaderFrame();
-                var userTopics = new SortedSet<string>();
-                List<byte[]> msg = [];
-                timer.Elapsed += (s, a) =>
+            var hbTimeFlag = 0L;
+            var checkTimeFlag = 0L;
+            var header = new UserRequestHeaderFrame();
+            var userTopics = new SortedSet<string>();
+
+            List<byte[]> sysMsg = [];
+            systemSocket.ReceiveReady += () =>
+            {
+                for (int i = 0; i < 200; i++)
                 {
-                    #region Connection Check
+                    if (systemSocket.TryReceiveMultipartBytes(ref sysMsg))
+                    {
+                        if (systemChannel.TryGetMsgType(sysMsg, out var type))
+                        {
+                            switch (type)
+                            {
+                                case (byte)MessageTypeEnum.USER_RSP:
+                                    if (UserResponseMessage.IsValid(sysMsg))
+                                    {
+                                        if (UserResponseHeaderFrame.TryParse(sysMsg[0], out UserResponseHeaderFrameField rspHeader))
+                                        {
+                                            if (RspInfoFrame.TryParse(sysMsg[1], out RspInfoFrameField rspInfo))
+                                            {
+                                                switch (rspHeader.FunctionID)
+                                                {
+                                                    case (byte)UserRequestFunctionEnum.LOGIN:
+                                                        ProcessRspLogin(sysMsg, rspInfo);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.LOGOUT:
+                                                        ProcessRspLogout(systemChannel, rspInfo, userTopics);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.SET_USER:
+                                                        ProcessRspSetUser(sysMsg, rspInfo, rspHeader.RequestID);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.RTN_PRIVATE:
+                                                        ProcessRspRtnPrivate(sysMsg, rspInfo, rspHeader.RequestID);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.SUB_ROUTE:
+                                                        ProcessRspSubRoute(sysMsg, rspInfo, rspHeader.RequestID);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.RSP_ROUTE:
+                                                        ProcessRspRspRoute(sysMsg, rspInfo, rspHeader.RequestID);
+                                                        break;
+                                                    default:
+                                                        break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    break;
+                                case (byte)MessageTypeEnum.WELCOME:
+                                    if (WelcomeMessage.TryParse(sysMsg[0], out WelcomeMessageField wc))
+                                    {
+                                        switch (_conStatus)
+                                        {
+                                            case ConnectionStatusEnum.IN_PROCESS:
+                                                SetConnStatus(ConnectionStatusEnum.OK);
+                                                systemChannel.SendHeartbeatSubMessage();
+                                                Task.Factory.StartNew(() =>
+                                                {
+                                                    OnFrontConnected(wc);
+                                                });
+                                                break;
+                                        }
+                                    }
+                                    break;
+                                case (byte)MessageTypeEnum.HEARTBEAT:
+                                    hbTimeFlag++;
+                                    if (HeartbeatMessage.TryParse(sysMsg[0], out HeartbeatMessageFiled hb))
+                                        OnHeartbeatReceived(hb);
+                                    break;
+                                case (byte)MessageTypeEnum.ROUTE:
+                                    if (RouteMessage.IsValid(sysMsg, out RouteHeaderFrameField routeHeader, out UserResponseHeaderFrameField userRspHeader))
+                                        OnRtnRoute(routeHeader, userRspHeader, sysMsg[1]);
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+                    }
+                }
+            };
+
+            List<byte[]> procMsg = [];
+            processSocket.ReceiveReady += () =>
+            {
+                for (int i = 0; i < 200; i++)
+                {
+                    if (processSocket.TryReceiveMultipartBytes(ref procMsg))
+                    {
+                        if (procMsg.Count > 0 && procMsg[0].Length > 0)
+                        {
+                            switch (procMsg[0][0])
+                            {
+                                case (byte)SystemApiFunctionEnum.LOGIN:
+                                    ReqLogin(systemChannel, header, procMsg, userTopics);
+                                    break;
+                                case (byte)SystemApiFunctionEnum.LOGOUT:
+                                    ReqLogout(systemChannel, header, procMsg);
+                                    break;
+                                case (byte)SystemApiFunctionEnum.SET_USER:
+                                    ReqSetUser(systemChannel, header, procMsg);
+                                    break;
+                                case (byte)SystemApiFunctionEnum.RTN_PRIVATE:
+                                    ReqRtnPrivate(systemChannel, header, procMsg);
+                                    break;
+                                case (byte)SystemApiFunctionEnum.SUB_ROUTE:
+                                    ReqSubRoute(systemChannel, header, procMsg);
+                                    break;
+                                case (byte)SystemApiFunctionEnum.RSP_ROUTE:
+                                    ReqRspRoute(systemChannel, header, procMsg);
+                                    break;
+                                case (byte)SystemApiFunctionEnum.DESTROY:
+                                    ReqDestroy(systemChannel, header);
+                                    break;
+                                case (byte)SystemApiFunctionEnum.DISCONNECT:
+                                    _runCts.Cancel();
+                                    Init();
+                                    OnFrontDisconnected((int)ErrorCodeEnum.DISCONNECT_FROM_EVENT_PRX);
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+                    }
+                }
+            };
+
+            List<byte[]> pubMsg = [];
+            publicSocket.ReceiveReady += () =>
+            {
+                for (int i = 0; i < 200; i++)
+                {
+                    if (publicSocket.TryReceiveMultipartBytes(ref pubMsg))
+                    {
+                        systemSocket.SendMultipart(pubMsg);
+                    }
+                }
+            };
+
+            _ = Task.Run(async () =>
+            {
+                var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(HEARTBEAT_CHECK_TIMER_INTERVAL));
+                while (await timer.WaitForNextTickAsync(ct))
+                {
                     switch (_conStatus)
                     {
                         case ConnectionStatusEnum.OK:
@@ -69,7 +204,7 @@ public class SystemApiContext : IDisposable
                             {
                                 if (checkTimeFlag == hbTimeFlag)
                                 {
-                                    poller.Stop();
+                                    _runCts.Cancel();
                                     Init();
                                     OnFrontDisconnected((int)ErrorCodeEnum.DISCONNECT_FROM_EVENT_PRX);
                                 }
@@ -80,151 +215,17 @@ public class SystemApiContext : IDisposable
                         default:
                             break;
                     }
-                    #endregion
-                };
-                systemSocket.ReceiveReady += (s, a) =>
-                {
-                    for (int i = 0; i < 200; i++)
-                    {
-                        if (a.Socket.TryReceiveMultipartBytes(ref msg))
-                        {
-                            if (systemChannel.TryGetMsgType(msg, out var type))
-                            {
-                                switch (type)
-                                {
-                                    case (byte)MessageTypeEnum.USER_RSP:
-                                        if (UserResponseMessage.IsValid(msg))
-                                        {
-                                            if (UserResponseHeaderFrame.TryParse(msg[0], out UserResponseHeaderFrameField rspHeader))
-                                            {
-                                                if (RspInfoFrame.TryParse(msg[1], out RspInfoFrameField rspInfo))
-                                                {
-                                                    switch (rspHeader.FunctionID)
-                                                    {
-                                                        case (byte)UserRequestFunctionEnum.LOGIN:
-                                                            ProcessRspLogin(msg, rspInfo);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.LOGOUT:
-                                                            ProcessRspLogout(systemChannel, rspInfo, userTopics);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.SET_USER:
-                                                            ProcessRspSetUser(msg, rspInfo, rspHeader.RequestID);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.RTN_PRIVATE:
-                                                            ProcessRspRtnPrivate(msg, rspInfo, rspHeader.RequestID);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.SUB_ROUTE:
-                                                            ProcessRspSubRoute(msg, rspInfo, rspHeader.RequestID);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.RSP_ROUTE:
-                                                            ProcessRspRspRoute(msg, rspInfo, rspHeader.RequestID);
-                                                            break;
-                                                        default:
-                                                            break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        break;
-                                    case (byte)MessageTypeEnum.WELCOME:
-                                        if (WelcomeMessage.TryParse(msg[0], out WelcomeMessageField wc))
-                                        {
-                                            switch (_conStatus)
-                                            {
-                                                case ConnectionStatusEnum.IN_PROCESS:
-                                                    SetConnStatus(ConnectionStatusEnum.OK);
-                                                    systemChannel.SendHeartbeatSubMessage();
-                                                    Task.Factory.StartNew(() =>
-                                                    {
-                                                        //Thread.Sleep(100);
-                                                        OnFrontConnected(wc);
-                                                    });
-                                                    break;
-                                            }
-                                        }
-                                        break;
-                                    case (byte)MessageTypeEnum.HEARTBEAT:
-                                        hbTimeFlag++;
-                                        if (HeartbeatMessage.TryParse(msg[0], out HeartbeatMessageFiled hb))
-                                            OnHeartbeatReceived(hb);
-                                        break;
-                                    case (byte)MessageTypeEnum.ROUTE:
-                                        if (RouteMessage.IsValid(msg, out RouteHeaderFrameField routeHeader, out UserResponseHeaderFrameField userRspHeader))
-                                            OnRtnRoute(routeHeader, userRspHeader, msg[1]);
-                                        break;
-                                    default:
-                                        break;
-                                }
-                            }
-                        }
-                    }                    
-                };
-                processSocket.ReceiveReady += (s, a) =>
-                {
-                    for (int i = 0; i < 200; i++)
-                    {
-                        if (a.Socket.TryReceiveMultipartBytes(ref msg))
-                        {
-                            if (msg.Count > 0 && msg[0].Length > 0)
-                            {
-                                switch (msg[0][0])
-                                {
-                                    case (byte)SystemApiFunctionEnum.LOGIN:
-                                        ReqLogin(systemChannel, header, msg, userTopics);
-                                        break;
-                                    case (byte)SystemApiFunctionEnum.LOGOUT:
-                                        ReqLogout(systemChannel, header, msg);
-                                        break;
-                                    case (byte)SystemApiFunctionEnum.SET_USER:
-                                        ReqSetUser(systemChannel, header, msg);
-                                        break;
-                                    case (byte)SystemApiFunctionEnum.RTN_PRIVATE:
-                                        ReqRtnPrivate(systemChannel, header, msg);
-                                        break;
-                                    case (byte)SystemApiFunctionEnum.SUB_ROUTE:
-                                        ReqSubRoute(systemChannel, header, msg);
-                                        break;
-                                    case (byte)SystemApiFunctionEnum.RSP_ROUTE:
-                                        ReqRspRoute(systemChannel, header, msg);
-                                        break;
-                                    case (byte)SystemApiFunctionEnum.DESTROY:
-                                        ReqDestroy(systemChannel, header);
-                                        break;
-                                    case (byte)SystemApiFunctionEnum.DISCONNECT:
-                                        poller.Stop();
-                                        Init();
-                                        OnFrontDisconnected((int)ErrorCodeEnum.DISCONNECT_FROM_EVENT_PRX);
-                                        break;
-                                    default:
-                                        break;
-                                }
-                            }
-                        }
-                    }                                        
-                };
-                publicSocket.ReceiveReady += (s, a) =>
-                {
-                    for (int i = 0; i < 200; i++)
-                    {
-                        if (a.Socket.TryReceiveMultipartBytes(ref msg))
-                        {
-                            systemSocket.SendMultipartBytes(msg);
-                        }
-                    }                    
-                };
-                poller.Add(publicSocket);
-                poller.Add(processSocket);
-                poller.Add(systemSocket);
-                poller.Add(timer);
-                poller.Run();
-            }
-            catch (TerminatingException) { }
+                }
+            }, ct);
+
+            await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false);
         });
     }
 
     #region Status Control
     private void Init()
     {
+        _runCts = new CancellationTokenSource();
         SetConnStatus(ConnectionStatusEnum.INIT);
     }
 
@@ -277,14 +278,11 @@ public class SystemApiContext : IDisposable
                     SetConnStatus(ConnectionStatusEnum.IN_PROCESS);
                     RunCore(address);
                     Thread.Sleep(SYSTEM_WAIT_INTERVAL);
-                    _process = new PublisherSocket();
-                    _process.Options.SendHighWatermark = 0;
+                    _process = new InprocChannel();
                     _process.Connect(INTERNAL_PROCESS_ADDRESS);
-                    _publicMain = new PublisherSocket();
-                    _publicMain.Options.SendHighWatermark = 0;
+                    _publicMain = new InprocChannel();
                     _publicMain.Connect(INTERNAL_PUBLIC_ADDRESS);
-                    _publicSub = new PublisherSocket();
-                    _publicSub.Options.SendHighWatermark = 0;
+                    _publicSub = new InprocChannel();
                     _publicSub.Connect(INTERNAL_PUBLIC_ADDRESS);
                     return (int)ErrorCodeEnum.OK;
                 }
@@ -320,10 +318,11 @@ public class SystemApiContext : IDisposable
                             SetLoginStatus(LoginStatusEnum.IN_PROCESS);
                             Thread.Sleep(SYSTEM_WAIT_INTERVAL);
                             _requestId = 0;
-                            _process.SendMoreFrame([(byte)SystemApiFunctionEnum.LOGIN])
-                                .SendMoreFrame(Global.REQUEST_ID.ToBytes(_requestId))
-                                .SendMoreFrame(Global.USER_ID.ToBytes(userID))
-                                .SendFrame(Global.PASSWORD.ToBytes(password));
+                            _process.SendMultipart(
+                                [(byte)SystemApiFunctionEnum.LOGIN],
+                                Global.REQUEST_ID.ToBytes(_requestId),
+                                Global.USER_ID.ToBytes(userID),
+                                Global.PASSWORD.ToBytes(password));
                             return (int)ErrorCodeEnum.OK;
                         default:
                             return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -343,8 +342,9 @@ public class SystemApiContext : IDisposable
                 switch (_loginStatus)
                 {
                     case LoginStatusEnum.OK:
-                        _process.SendMoreFrame([(byte)SystemApiFunctionEnum.LOGOUT])
-                            .SendFrame(Global.REQUEST_ID.ToBytes(++_requestId));
+                        _process.SendMultipart(
+                            [(byte)SystemApiFunctionEnum.LOGOUT],
+                            Global.REQUEST_ID.ToBytes(++_requestId));
                         return (int)ErrorCodeEnum.OK;
                     default:
                         return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -372,7 +372,6 @@ public class SystemApiContext : IDisposable
         }
     }
 
-    //OK
     public int SetUser(string userID, string password, UserStatusEnum status, UserRoleEnum role, int connectionLimit)
     {
         if (Global.USER_ID.Check(userID) && Global.PASSWORD.Check(password))
@@ -383,9 +382,10 @@ public class SystemApiContext : IDisposable
                     switch (_loginStatus)
                     {
                         case LoginStatusEnum.OK:
-                            _process.SendMoreFrame([(byte)SystemApiFunctionEnum.SET_USER])
-                                .SendMoreFrame(Global.REQUEST_ID.ToBytes(++_requestId))
-                                .SendFrame(User.GetBytes(new UserField()
+                            _process.SendMultipart(
+                                [(byte)SystemApiFunctionEnum.SET_USER],
+                                Global.REQUEST_ID.ToBytes(++_requestId),
+                                User.GetBytes(new UserField()
                                 {
                                     UserID = userID,
                                     Password = password,
@@ -404,7 +404,6 @@ public class SystemApiContext : IDisposable
         return (int)ErrorCodeEnum.FUNCTION_ARGS_ERROR;
     }
 
-    //OK
     public int RtnPrivate(int functionCode, string userID, string data)
     {
         if (Global.USER_ID.Check(userID))
@@ -415,9 +414,10 @@ public class SystemApiContext : IDisposable
                     switch (_loginStatus)
                     {
                         case LoginStatusEnum.OK:
-                            _process.SendMoreFrame([(byte)SystemApiFunctionEnum.RTN_PRIVATE])
-                                .SendMoreFrame(Global.REQUEST_ID.ToBytes(++_requestId))
-                                .SendFrame(PrivateMessage.GetBytes(functionCode, userID, data));
+                            _process.SendMultipart(
+                                [(byte)SystemApiFunctionEnum.RTN_PRIVATE],
+                                Global.REQUEST_ID.ToBytes(++_requestId),
+                                PrivateMessage.GetBytes(functionCode, userID, data));
                             return (int)ErrorCodeEnum.OK;
                         default:
                             return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -437,9 +437,10 @@ public class SystemApiContext : IDisposable
                 switch (_loginStatus)
                 {
                     case LoginStatusEnum.OK:
-                        _process.SendMoreFrame([(byte)SystemApiFunctionEnum.SUB_ROUTE])
-                            .SendMoreFrame(Global.REQUEST_ID.ToBytes(++_requestId))
-                            .SendFrame(Global.FUNCTION_CODE.ToBytes(functionCode));
+                        _process.SendMultipart(
+                            [(byte)SystemApiFunctionEnum.SUB_ROUTE],
+                            Global.REQUEST_ID.ToBytes(++_requestId),
+                            Global.FUNCTION_CODE.ToBytes(functionCode));
                         return (int)ErrorCodeEnum.OK;
                     default:
                         return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -459,11 +460,14 @@ public class SystemApiContext : IDisposable
                     switch (_loginStatus)
                     {
                         case LoginStatusEnum.OK:
-                            _process.SendMoreFrame([(byte)SystemApiFunctionEnum.RSP_ROUTE])
-                                .SendMoreFrame(Global.REQUEST_ID.ToBytes(++_requestId))
-                                .SendMoreFrame(rspHeader)
-                                .SendMoreFrame(RspInfoFrame.GetBytes(time, errorCode, errorMSg, isLast))
-                                .SendFrame(rspData);
+                            _process.SendMultipart(new List<byte[]>
+                            {
+                                new byte[] { (byte)SystemApiFunctionEnum.RSP_ROUTE },
+                                Global.REQUEST_ID.ToBytes(++_requestId),
+                                rspHeader,
+                                RspInfoFrame.GetBytes(time, errorCode, errorMSg, isLast),
+                                rspData
+                            });
                             return (int)ErrorCodeEnum.OK;
                         default:
                             return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -475,7 +479,6 @@ public class SystemApiContext : IDisposable
         return (int)ErrorCodeEnum.FUNCTION_ARGS_ERROR;
     }
 
-    //OK
     public int SET(string key, byte[] value)
     {
         if (PublicCommandHeaderFrame.TryGetBytes_SET(key, out var comm))
@@ -485,8 +488,7 @@ public class SystemApiContext : IDisposable
         return (int)ErrorCodeEnum.FUNCTION_ARGS_ERROR;
     }
 
-    //OK
-    public int PUB(byte[] data)    
+    public int PUB(byte[] data)
     {
         if (PublicCommandHeaderFrame.TryGetBytes_PUB(out var comm))
         {
@@ -495,7 +497,6 @@ public class SystemApiContext : IDisposable
         return (int)ErrorCodeEnum.FUNCTION_ARGS_ERROR;
     }
 
-    //OK
     public int SPUB(byte topicLength, byte[] data)
     {
         if (PublicCommandHeaderFrame.TryGetBytes_SPUB(topicLength, data, out var comm))
@@ -510,7 +511,7 @@ public class SystemApiContext : IDisposable
         switch (_conStatus)
         {
             case ConnectionStatusEnum.OK:
-                _publicMain.SendMoreFrame(commFrame).SendFrame(dataFrame);
+                _publicMain.SendMultipart(commFrame, dataFrame);
                 return (int)ErrorCodeEnum.OK;
             default:
                 return (int)ErrorCodeEnum.CONNECTION_STATUS_ERROR;

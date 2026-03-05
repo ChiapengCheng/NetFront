@@ -1,18 +1,15 @@
-﻿using NetFront.Channels;
-using NetMQ;
-using NetMQ.Sockets;
+using NetFront.Channels;
+using NetFront.Transport;
 
 namespace NetFront.ClientApi;
 
 public class ClientChannel : Channel
 {
-    private readonly XSubscriberSocket Socket;
+    private readonly TcpSubClient Socket;
 
-    public ClientChannel(XSubscriberSocket socket, string address, int receiveHighWatermark, int sendHighWatermark)
+    public ClientChannel(TcpSubClient socket, string address, int receiveHighWatermark, int sendHighWatermark)
     {
         Socket = socket;
-        Socket.Options.SendHighWatermark = sendHighWatermark;
-        Socket.Options.ReceiveHighWatermark = receiveHighWatermark;
         Socket.Connect(address);
     }
 
@@ -28,6 +25,6 @@ public class ClientChannel : Channel
 
     public void SendUserRequestMessage(byte[] header, byte[] data)
     {
-        Socket.SendMoreFrame(header).SendFrame(data);
+        Socket.SendMultipart(header, data);
     }
 }

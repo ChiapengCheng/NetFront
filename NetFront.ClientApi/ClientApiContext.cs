@@ -1,8 +1,7 @@
-﻿using NetFront.Frames;
+using NetFront.Frames;
 using NetFront.Messages;
+using NetFront.Transport;
 using NetFront.UserManagement;
-using NetMQ;
-using NetMQ.Sockets;
 
 namespace NetFront.ClientApi;
 
@@ -12,8 +11,9 @@ public class ClientApiContext : IDisposable
     private const int HEARTBEAT_CHECK_TIMER_INTERVAL = 30000;
     private ConnectionStatusEnum _conStatus;
     private LoginStatusEnum _loginStatus;
-    private PublisherSocket _process = default!;
+    private InprocChannel _process = default!;
     private int _requestId;
+    private CancellationTokenSource _runCts = new();
 
     public LoginStatusEnum LoginStatus
     {
@@ -32,31 +32,166 @@ public class ClientApiContext : IDisposable
 
     public void Dispose()
     {
+        _runCts.Cancel();
         GC.SuppressFinalize(this);
     }
 
     private void RunCore(string address)
     {
-        Task.Factory.StartNew(() =>
+        Task.Factory.StartNew(async () =>
         {
-            try
-            {
-                var timer = new NetMQTimer(HEARTBEAT_CHECK_TIMER_INTERVAL);
-                using var processSocket = new XSubscriberSocket();
-                using var clientSocket = new XSubscriberSocket();
-                using var poller = new NetMQPoller();
-                var clientChannel = new ClientChannel(clientSocket, address, 0, 0);
-                var processChannel = new ProcessChannel(processSocket, INTERNAL_ADDRESS, 0, 0);
+            var ct = _runCts.Token;
+            using var processSocket = new InprocChannel();
+            using var clientSocket = new TcpSubClient();
+            var clientChannel = new ClientChannel(clientSocket, address, 0, 0);
+            var processChannel = new ProcessChannel(processSocket, INTERNAL_ADDRESS, 0, 0);
 
-                var hbTimeFlag = 0L;
-                var checkTimeFlag = 0L;
-                var header = new UserRequestHeaderFrame();
-                var userTopics = new SortedSet<string>();
-                var dicFunctionCode = new Dictionary<int, int>();
-                List<byte[]> msg = [];
-                timer.Elapsed += (s, a) =>
+            var hbTimeFlag = 0L;
+            var checkTimeFlag = 0L;
+            var header = new UserRequestHeaderFrame();
+            var userTopics = new SortedSet<string>();
+            var dicFunctionCode = new Dictionary<int, int>();
+
+            List<byte[]> clientMsg = [];
+            clientSocket.ReceiveReady += () =>
+            {
+                for (int i = 0; i < 200; i++)
                 {
-                    #region Connection Check
+                    if (clientSocket.TryReceiveMultipartBytes(ref clientMsg))
+                    {
+                        if (clientChannel.TryGetMsgType(clientMsg, out var type))
+                        {
+                            switch (type)
+                            {
+                                case (byte)MessageTypeEnum.PUBLIC:
+                                    OnRtnPublic(clientMsg[0]);
+                                    break;
+                                case (byte)MessageTypeEnum.PRIVATE:
+                                    if (PrivateMessage.TryParse(clientMsg[0], out PrivateMessageField field))
+                                        OnRtnPrivate(field);
+                                    break;
+                                case (byte)MessageTypeEnum.USER_RSP:
+                                    if (UserResponseMessage.IsValid(clientMsg))
+                                    {
+                                        if (UserResponseHeaderFrame.TryParse(clientMsg[0], out UserResponseHeaderFrameField rspHeader))
+                                        {
+                                            if (RspInfoFrame.TryParse(clientMsg[1], out RspInfoFrameField rspInfo))
+                                            {
+                                                switch (rspHeader.FunctionID)
+                                                {
+                                                    case (byte)UserRequestFunctionEnum.LOGIN:
+                                                        ProcessRspLogin(clientMsg, rspInfo);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.LOGOUT:
+                                                        ProcessRspLogout(clientChannel, rspInfo, userTopics);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.SUB_PUBLIC:
+                                                        ProcessRspSubPublic(clientMsg, rspInfo, rspHeader.RequestID);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.GET_PUBLIC:
+                                                        ProcessRspGetPublic(clientMsg, rspInfo, rspHeader.RequestID);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.SUB_PRIVATE:
+                                                        ProcessRspSubPrivate(clientMsg, rspInfo, rspHeader.RequestID);
+                                                        break;
+                                                    case (byte)UserRequestFunctionEnum.REQ_ROUTE:
+                                                        ProcessRspRoute(clientMsg, rspInfo, rspHeader.RequestID, dicFunctionCode);
+                                                        break;
+                                                    default:
+                                                        break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    break;
+                                case (byte)MessageTypeEnum.WELCOME:
+                                    if (WelcomeMessage.TryParse(clientMsg[0], out WelcomeMessageField wc))
+                                    {
+                                        switch (_conStatus)
+                                        {
+                                            case ConnectionStatusEnum.IN_PROCESS:
+                                                SetConnStatus(ConnectionStatusEnum.OK);
+                                                clientChannel.SendHeartbeatSubMessage();
+                                                Task.Factory.StartNew(() =>
+                                                {
+                                                    OnFrontConnected(wc);
+                                                });
+                                                break;
+                                        }
+                                    }
+                                    break;
+                                case (byte)MessageTypeEnum.HEARTBEAT:
+                                    hbTimeFlag++;
+                                    if (HeartbeatMessage.TryParse(clientMsg[0], out HeartbeatMessageFiled hb))
+                                        OnHeartbeatReceived(hb);
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+                    }
+                }
+            };
+
+            List<byte[]> procMsg = [];
+            processSocket.ReceiveReady += () =>
+            {
+                for (int i = 0; i < 200; i++)
+                {
+                    if (processSocket.TryReceiveMultipartBytes(ref procMsg))
+                    {
+                        if (procMsg.Count > 0 && procMsg[0].Length > 0)
+                        {
+                            switch (procMsg[0][0])
+                            {
+                                case (byte)ClientApiFunctionEnum.LOGIN:
+                                    ReqLogin(clientChannel, header, procMsg, userTopics);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.LOGOUT:
+                                    ReqLogout(clientChannel, header, procMsg);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.SUB_PUBLIC:
+                                    ReqSubPublic(clientChannel, header, procMsg, userTopics);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.GET_PUBLIC:
+                                    ReqGetPublic(clientChannel, header, procMsg);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.UNSUB_PUBLIC:
+                                    ReqUnsubPublic(clientChannel, procMsg, userTopics);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.SUB_PRIVATE:
+                                    ReqSubPrivate(clientChannel, header, procMsg, userTopics);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.UNSUB_PRIVATE:
+                                    ReqUnsubPrivate(clientChannel, procMsg, header, userTopics);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.REQ_ROUTE:
+                                    ReqReqRoute(clientChannel, header, procMsg, dicFunctionCode);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.DESTROY:
+                                    ReqDestroy(clientChannel, header);
+                                    break;
+                                case (byte)ClientApiFunctionEnum.DISCONNECT:
+                                    _runCts.Cancel();
+                                    Init();
+                                    OnFrontDisconnected((int)ErrorCodeEnum.DISCONNECT_FROM_EVENT_PRX);
+                                    break;
+                                case 101:
+                                    ReqReq101(clientChannel, header, procMsg);
+                                    break;
+                                default:
+                                    break;
+                            }
+                        }
+                    }
+                }
+            };
+
+            _ = Task.Run(async () =>
+            {
+                var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(HEARTBEAT_CHECK_TIMER_INTERVAL));
+                while (await timer.WaitForNextTickAsync(ct))
+                {
                     switch (_conStatus)
                     {
                         case ConnectionStatusEnum.OK:
@@ -64,7 +199,7 @@ public class ClientApiContext : IDisposable
                             {
                                 if (checkTimeFlag == hbTimeFlag)
                                 {
-                                    poller.Stop();
+                                    _runCts.Cancel();
                                     Init();
                                     OnFrontDisconnected((int)ErrorCodeEnum.DISCONNECT_FROM_EVENT_PRX);
                                 }
@@ -75,153 +210,17 @@ public class ClientApiContext : IDisposable
                         default:
                             break;
                     }
-                    #endregion
-                };
-                clientSocket.ReceiveReady += (s, a) =>
-                {
-                    for (int i = 0; i < 200; i++)
-                    {
-                        if (a.Socket.TryReceiveMultipartBytes(ref msg))
-                        {
-                            if (clientChannel.TryGetMsgType(msg, out var type))
-                            {
-                                switch (type)
-                                {
-                                    case (byte)MessageTypeEnum.PUBLIC:
-                                        OnRtnPublic(msg[0]);
-                                        break;
-                                    case (byte)MessageTypeEnum.PRIVATE:
-                                        if (PrivateMessage.TryParse(msg[0], out PrivateMessageField field))
-                                            OnRtnPrivate(field);
-                                        break;
-                                    case (byte)MessageTypeEnum.USER_RSP:
-                                        if (UserResponseMessage.IsValid(msg))
-                                        {
-                                            if (UserResponseHeaderFrame.TryParse(msg[0], out UserResponseHeaderFrameField rspHeader))
-                                            {
-                                                if (RspInfoFrame.TryParse(msg[1], out RspInfoFrameField rspInfo))
-                                                {
-                                                    switch (rspHeader.FunctionID)
-                                                    {
-                                                        case (byte)UserRequestFunctionEnum.LOGIN:
-                                                            ProcessRspLogin(msg, rspInfo);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.LOGOUT:
-                                                            ProcessRspLogout(clientChannel, rspInfo, userTopics);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.SUB_PUBLIC:
-                                                            ProcessRspSubPublic(msg, rspInfo, rspHeader.RequestID);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.GET_PUBLIC:
-                                                            ProcessRspGetPublic(msg, rspInfo, rspHeader.RequestID);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.SUB_PRIVATE:
-                                                            ProcessRspSubPrivate(msg, rspInfo, rspHeader.RequestID);
-                                                            break;
-                                                        case (byte)UserRequestFunctionEnum.REQ_ROUTE:
-                                                            ProcessRspRoute(msg, rspInfo, rspHeader.RequestID, dicFunctionCode);
-                                                            break;
-                                                        default:
-                                                            //ProcessRspServiceData(msg, ref rspHeader, ref rspInfo);
-                                                            break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        break;
-                                    case (byte)MessageTypeEnum.WELCOME:
-                                        if (WelcomeMessage.TryParse(msg[0], out WelcomeMessageField wc))
-                                        {
-                                            switch (_conStatus)
-                                            {
-                                                case ConnectionStatusEnum.IN_PROCESS:
-                                                    SetConnStatus(ConnectionStatusEnum.OK);
-                                                    clientChannel.SendHeartbeatSubMessage();
-                                                    Task.Factory.StartNew(() =>
-                                                    {
-                                                        //Thread.Sleep(100);
-                                                        OnFrontConnected(wc);
-                                                    });
-                                                    break;
-                                            }
-                                        }
-                                        break;
-                                    case (byte)MessageTypeEnum.HEARTBEAT:
-                                        hbTimeFlag++;
-                                        if (HeartbeatMessage.TryParse(msg[0], out HeartbeatMessageFiled hb))
-                                            OnHeartbeatReceived(hb);
-                                        break;
-                                    default:
-                                        break;
-                                }
-                            }
-                        }                        
-                    }
-                };
-                processSocket.ReceiveReady += (s, a) =>
-                {
-                    for (int i = 0; i < 200; i++)
-                    {
-                        if (a.Socket.TryReceiveMultipartBytes(ref msg))
-                        {
-                            if (msg.Count > 0 && msg[0].Length > 0)
-                            {
-                                switch (msg[0][0])
-                                {
-                                    case (byte)ClientApiFunctionEnum.LOGIN:
-                                        ReqLogin(clientChannel, header, msg, userTopics);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.LOGOUT:
-                                        ReqLogout(clientChannel, header, msg);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.SUB_PUBLIC:
-                                        ReqSubPublic(clientChannel, header, msg, userTopics);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.GET_PUBLIC:
-                                        ReqGetPublic(clientChannel, header, msg);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.UNSUB_PUBLIC:
-                                        ReqUnsubPublic(clientChannel, msg, userTopics);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.SUB_PRIVATE:
-                                        ReqSubPrivate(clientChannel, header, msg, userTopics);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.UNSUB_PRIVATE:
-                                        ReqUnsubPrivate(clientChannel, msg, header, userTopics);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.REQ_ROUTE:
-                                        ReqReqRoute(clientChannel, header, msg, dicFunctionCode);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.DESTROY:
-                                        ReqDestroy(clientChannel, header);
-                                        break;
-                                    case (byte)ClientApiFunctionEnum.DISCONNECT:
-                                        poller.Stop();
-                                        Init();
-                                        OnFrontDisconnected((int)ErrorCodeEnum.DISCONNECT_FROM_EVENT_PRX);
-                                        break;
-                                    case 101:
-                                        ReqReq101(clientChannel,header,msg);
-                                        break;
-                                    default:
-                                        break;
-                                }
-                            }
-                        }                        
-                    }
-                };
-                poller.Add(timer);
-                poller.Add(clientSocket);
-                poller.Add(processSocket);
-                poller.Run();
-            }
-            catch (TerminatingException) { }
+                }
+            }, ct);
+
+            await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false);
         });
     }
 
     #region Status Control
     private void Init()
     {
+        _runCts = new CancellationTokenSource();
         SetConnStatus(ConnectionStatusEnum.INIT);
     }
 
@@ -273,8 +272,7 @@ public class ClientApiContext : IDisposable
                     SetConnStatus(ConnectionStatusEnum.IN_PROCESS);
                     RunCore(address);
                     Thread.Sleep(200);
-                    _process = new PublisherSocket();
-                    _process.Options.SendHighWatermark = 0;
+                    _process = new InprocChannel();
                     _process.Connect(INTERNAL_ADDRESS);
                     return (int)ErrorCodeEnum.OK;
                 }
@@ -310,10 +308,11 @@ public class ClientApiContext : IDisposable
                             SetLoginStatus(LoginStatusEnum.IN_PROCESS);
                             Thread.Sleep(200);
                             _requestId = 0;
-                            _process.SendMoreFrame([(byte)ClientApiFunctionEnum.LOGIN])
-                                    .SendMoreFrame(Global.REQUEST_ID.ToBytes(_requestId))
-                                    .SendMoreFrame(Global.USER_ID.ToBytes(userID))
-                                    .SendFrame(Global.PASSWORD.ToBytes(password));
+                            _process.SendMultipart(
+                                [(byte)ClientApiFunctionEnum.LOGIN],
+                                Global.REQUEST_ID.ToBytes(_requestId),
+                                Global.USER_ID.ToBytes(userID),
+                                Global.PASSWORD.ToBytes(password));
                             return (int)ErrorCodeEnum.OK;
                         default:
                             return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -333,8 +332,9 @@ public class ClientApiContext : IDisposable
                 switch (_loginStatus)
                 {
                     case LoginStatusEnum.OK:
-                        _process.SendMoreFrame([(byte)ClientApiFunctionEnum.LOGOUT])
-                            .SendFrame(Global.REQUEST_ID.ToBytes(++_requestId));
+                        _process.SendMultipart(
+                            [(byte)ClientApiFunctionEnum.LOGOUT],
+                            Global.REQUEST_ID.ToBytes(++_requestId));
                         return (int)ErrorCodeEnum.OK;
                     default:
                         return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -362,13 +362,11 @@ public class ClientApiContext : IDisposable
         }
     }
 
-    //OK
     public int SubPublic(string topic, out int requestId)
     {
         return SubPublic(Serializer.GetUtf8Bytes(topic), out requestId);
     }
 
-    //OK
     public int SubPublic(byte[] topic, out int requestId)
     {
         switch (_conStatus)
@@ -382,9 +380,10 @@ public class ClientApiContext : IDisposable
                             if (topic.Length >= 2)
                             {
                                 requestId = ++_requestId;
-                                _process.SendMoreFrame([(byte)ClientApiFunctionEnum.SUB_PUBLIC])
-                                    .SendMoreFrame(Global.REQUEST_ID.ToBytes(requestId))
-                                    .SendFrame(topic);
+                                _process.SendMultipart(
+                                    [(byte)ClientApiFunctionEnum.SUB_PUBLIC],
+                                    Global.REQUEST_ID.ToBytes(requestId),
+                                    topic);
                                 return (int)ErrorCodeEnum.OK;
                             }
                         }
@@ -400,7 +399,6 @@ public class ClientApiContext : IDisposable
         }
     }
 
-    //OK
     public int SubPrivate(int functionCode, out int requestId)
     {
         switch (_conStatus)
@@ -410,9 +408,10 @@ public class ClientApiContext : IDisposable
                 {
                     case LoginStatusEnum.OK:
                         requestId = ++_requestId;
-                        _process.SendMoreFrame([(byte)ClientApiFunctionEnum.SUB_PRIVATE])
-                            .SendMoreFrame(Global.REQUEST_ID.ToBytes(requestId))
-                            .SendFrame(Global.FUNCTION_CODE.ToBytes(functionCode));
+                        _process.SendMultipart(
+                            [(byte)ClientApiFunctionEnum.SUB_PRIVATE],
+                            Global.REQUEST_ID.ToBytes(requestId),
+                            Global.FUNCTION_CODE.ToBytes(functionCode));
                         return (int)ErrorCodeEnum.OK;
                     default:
                         requestId = -1;
@@ -424,13 +423,11 @@ public class ClientApiContext : IDisposable
         }
     }
 
-    //OK
     public int UnsubPublic(string topic)
     {
         return UnsubPublic(Serializer.GetUtf8Bytes(topic));
     }
 
-    //OK
     public int UnsubPublic(byte[] topic)
     {
         switch (_conStatus)
@@ -441,8 +438,9 @@ public class ClientApiContext : IDisposable
                     case LoginStatusEnum.OK:
                         if (topic != null)
                             if (topic.Length >= 2)
-                                _process.SendMoreFrame([(byte)ClientApiFunctionEnum.UNSUB_PUBLIC])
-                                    .SendFrame(topic);
+                                _process.SendMultipart(
+                                    [(byte)ClientApiFunctionEnum.UNSUB_PUBLIC],
+                                    topic);
                         return (int)ErrorCodeEnum.OK;
                     default:
                         return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -452,7 +450,6 @@ public class ClientApiContext : IDisposable
         }
     }
 
-    //OK
     public int UnsubPrivate(int functionCode)
     {
         switch (_conStatus)
@@ -461,8 +458,9 @@ public class ClientApiContext : IDisposable
                 switch (_loginStatus)
                 {
                     case LoginStatusEnum.OK:
-                        _process.SendMoreFrame([(byte)ClientApiFunctionEnum.UNSUB_PRIVATE])
-                            .SendFrame(Global.FUNCTION_CODE.ToBytes(functionCode));
+                        _process.SendMultipart(
+                            [(byte)ClientApiFunctionEnum.UNSUB_PRIVATE],
+                            Global.FUNCTION_CODE.ToBytes(functionCode));
                         return (int)ErrorCodeEnum.OK;
                     default:
                         return (int)ErrorCodeEnum.LOGIN_STATUS_ERROR;
@@ -472,13 +470,11 @@ public class ClientApiContext : IDisposable
         }
     }
 
-    //OK
     public int GetPublic(string key, out int requestId)
     {
         return GetPublic(Serializer.GetUtf8Bytes(key), out requestId);
     }
 
-    //OK
     public int GetPublic(byte[] key, out int requestId)
     {
         switch (_conStatus)
@@ -488,9 +484,10 @@ public class ClientApiContext : IDisposable
                 {
                     case LoginStatusEnum.OK:
                         requestId = ++_requestId;
-                        _process.SendMoreFrame([(byte)ClientApiFunctionEnum.GET_PUBLIC])
-                            .SendMoreFrame(Global.REQUEST_ID.ToBytes(requestId))
-                            .SendFrame(key);
+                        _process.SendMultipart(
+                            [(byte)ClientApiFunctionEnum.GET_PUBLIC],
+                            Global.REQUEST_ID.ToBytes(requestId),
+                            key);
                         return (int)ErrorCodeEnum.OK;
                     default:
                         requestId = -1;
@@ -511,10 +508,11 @@ public class ClientApiContext : IDisposable
                 {
                     case LoginStatusEnum.OK:
                         requestId = ++_requestId;
-                        _process.SendMoreFrame([(byte)ClientApiFunctionEnum.REQ_ROUTE])
-                            .SendMoreFrame(Global.REQUEST_ID.ToBytes(requestId))
-                            .SendMoreFrame(Global.FUNCTION_CODE.ToBytes(functionCode))
-                            .SendFrame(data);
+                        _process.SendMultipart(
+                            [(byte)ClientApiFunctionEnum.REQ_ROUTE],
+                            Global.REQUEST_ID.ToBytes(requestId),
+                            Global.FUNCTION_CODE.ToBytes(functionCode),
+                            data);
                         return (int)ErrorCodeEnum.OK;
                     default:
                         requestId = -1;
@@ -524,7 +522,6 @@ public class ClientApiContext : IDisposable
                 requestId = -1;
                 return (int)ErrorCodeEnum.CONNECTION_STATUS_ERROR;
         }
-
     }
 
     public int Req101(string strategyID, out int requestId)
@@ -536,9 +533,10 @@ public class ClientApiContext : IDisposable
                 {
                     case LoginStatusEnum.OK:
                         requestId = ++_requestId;
-                        _process.SendMoreFrame([101])
-                            .SendMoreFrame(Global.REQUEST_ID.ToBytes(requestId))
-                            .SendFrame(Serializer.GetUtf8Bytes(strategyID));
+                        _process.SendMultipart(
+                            [101],
+                            Global.REQUEST_ID.ToBytes(requestId),
+                            Serializer.GetUtf8Bytes(strategyID));
                         return (int)ErrorCodeEnum.OK;
                     default:
                         requestId = -1;
@@ -669,7 +667,7 @@ public class ClientApiContext : IDisposable
     private static void ReqUnsubPublic(ClientChannel channel, List<byte[]> msg, SortedSet<string> userTopics)
     {
         if (msg.Count == 2)
-        {            
+        {
             var topic = Serializer.ReadStringUtf8(msg[1]);
             channel.SendUserUnsubMessage(UserUnsubMessage.GetBytes(topic));
             userTopics.Remove(topic);
@@ -705,7 +703,7 @@ public class ClientApiContext : IDisposable
             channel.SendUserRequestMessage(header.GetBuffer(), msg[2]);
         }
     }
-    #endregion    
+    #endregion
 
     #region Events
     public event EventHandler<RspRouteEventArgs>? RspRoute;
@@ -828,5 +826,4 @@ public class ClientApiContext : IDisposable
         FrontConnected?.Invoke(this, new FrontConnectedEventArgs(message));
     }
     #endregion
-
 }

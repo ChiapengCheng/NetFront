@@ -1,19 +1,15 @@
-﻿using NetFront.Channels;
-using NetMQ;
-using NetMQ.Sockets;
+using NetFront.Channels;
+using NetFront.Transport;
 
 namespace NetFront.ClientApi;
 
 public class ProcessChannel : Channel
 {
-    private readonly XSubscriberSocket XSub;
+    private readonly InprocChannel XSub;
 
-    public ProcessChannel(XSubscriberSocket socket, string address, int receiveHighWatermark, int sendHighWatermark)
+    public ProcessChannel(InprocChannel socket, string address, int receiveHighWatermark, int sendHighWatermark)
     {
         XSub = socket;
-        XSub.Options.ReceiveHighWatermark = receiveHighWatermark;
-        XSub.Options.SendHighWatermark = sendHighWatermark;
         XSub.Bind(address);
-        XSub.SendFrame([1]);
     }
 }
